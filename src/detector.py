@@ -14,7 +14,11 @@ from typing import List, Optional, Union
 from .models.issue import BugCategory, CodeIssue, DetectionResult, Severity
 
 # 折扣 / 优惠相关的变量名。命中即认为它可能是"率"而不是"系数"
-DISCOUNT_PATTERN = re.compile(r"(discount|rebate|promo|off_rate|coupon)", re.IGNORECASE)
+DISCOUNT_PATTERN = re.compile(r"(discount|rebate|promo|coupon|off_rate)", re.IGNORECASE)
+# 金额 / 比率相关的命名，用于浮点相等比较规则
+MONEY_PATTERN = re.compile(
+    r"(price|total|amount|revenue|cost|balance|discount|rate|tax)", re.IGNORECASE
+)
 
 
 class BugDetector:
@@ -31,6 +35,9 @@ class BugDetector:
         tree = ast.parse(source, filename=filename or "<string>")
         issues: List[CodeIssue] = []
         issues.extend(self._rule_discount_multiplier(tree, source))
+        issues.extend(self._rule_mutable_default(tree, source))
+        issues.extend(self._rule_bare_except(tree, source))
+        issues.extend(self._rule_float_equality(tree, source))
         issues.sort(key=lambda i: (i.lineno, i.col_offset))
         return DetectionResult(file=filename, issues=issues)
 
@@ -80,3 +87,96 @@ class BugDetector:
             if DISCOUNT_PATTERN.search(name):
                 return name
         return None
+
+    # ------------------------------------------------------------- CF002
+
+    def _rule_mutable_default(self, tree: ast.AST, source: str) -> List[CodeIssue]:
+        """可变默认参数：默认值在函数定义时只求值一次，会被跨调用共享。"""
+        mutable = (ast.List, ast.Dict, ast.Set, ast.ListComp, ast.DictComp, ast.SetComp)
+        issues: List[CodeIssue] = []
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for default in node.args.defaults + [d for d in node.args.kw_defaults if d]:
+                if isinstance(default, mutable):
+                    issues.append(
+                        CodeIssue(
+                            rule_id="CF002",
+                            category=BugCategory.MUTABLE_DEFAULT,
+                            severity=Severity.HIGH,
+                            lineno=default.lineno,
+                            col_offset=default.col_offset,
+                            end_lineno=default.end_lineno or default.lineno,
+                            end_col_offset=default.end_col_offset or default.col_offset,
+                            snippet=ast.get_source_segment(source, default) or "",
+                            message=f"函数 {node.name} 使用可变对象作为默认参数",
+                            explanation=(
+                                "默认值在函数定义时求值一次，所有调用共享同一个对象。"
+                                "函数内部一旦修改它，下一次调用的初始状态就被污染了。"
+                            ),
+                            hint="改为 None 作为默认值，在函数体内 `if x is None: x = []`",
+                        )
+                    )
+        return issues
+
+    # ------------------------------------------------------------- CF003
+
+    def _rule_bare_except(self, tree: ast.AST, source: str) -> List[CodeIssue]:
+        """裸 except：连 KeyboardInterrupt 和 SystemExit 一起吞掉。"""
+        issues: List[CodeIssue] = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ExceptHandler) and node.type is None:
+                issues.append(
+                    CodeIssue(
+                        rule_id="CF003",
+                        category=BugCategory.BARE_EXCEPT,
+                        severity=Severity.MEDIUM,
+                        lineno=node.lineno,
+                        col_offset=node.col_offset,
+                        end_lineno=node.end_lineno or node.lineno,
+                        end_col_offset=node.end_col_offset or node.col_offset,
+                        snippet="except:",
+                        message="裸 except 会吞掉所有异常",
+                        explanation=(
+                            "裸 except 同时捕获 KeyboardInterrupt / SystemExit，"
+                            "Ctrl+C 失效，真实错误被静默成一条空分支，线上排查会非常痛苦。"
+                        ),
+                        hint="改为 `except Exception as exc:` 并至少记录日志",
+                    )
+                )
+        return issues
+
+    # ------------------------------------------------------------- CF004
+
+    def _rule_float_equality(self, tree: ast.AST, source: str) -> List[CodeIssue]:
+        """金额 / 比率用 == 比较。0.1+0.2 != 0.3 的经典坑。"""
+        issues: List[CodeIssue] = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Compare):
+                continue
+            if not any(isinstance(op, ast.Eq) for op in node.ops):
+                continue
+            names = [n.id for n in ast.walk(node) if isinstance(n, ast.Name)]
+            hit = next((n for n in names if MONEY_PATTERN.search(n)), None)
+            if hit is None:
+                continue
+            issues.append(
+                CodeIssue(
+                    rule_id="CF004",
+                    category=BugCategory.FLOAT_EQUALITY,
+                    severity=Severity.MEDIUM,
+                    lineno=node.lineno,
+                    col_offset=node.col_offset,
+                    end_lineno=node.end_lineno or node.lineno,
+                    end_col_offset=node.end_col_offset or node.col_offset,
+                    snippet=ast.get_source_segment(source, node) or "",
+                    message=f"浮点数 {hit} 使用 == 精确比较",
+                    explanation=(
+                        "二进制浮点无法精确表示 0.1 这类十进制小数，"
+                        "`0.1 + 0.2 == 0.3` 为 False。金额比较应走 Decimal 或 round 后比对，"
+                        "或使用 math.isclose。"
+                    ),
+                    hint="改用 math.isclose(a, b, rel_tol=1e-9) 或 Decimal 比较",
+                )
+            )
+        return issues
