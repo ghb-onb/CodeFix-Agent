@@ -72,6 +72,9 @@ class CodeFixer:
         other = node.right if discount_is_left else node.left
 
         other_src = ast.get_source_segment(source, other) or ast.unparse(other)
+        # 另一侧如果是表达式（如 1 + TAX_RATE），加括号保证运算优先级不被改掉
+        if isinstance(other, (ast.BinOp, ast.BoolOp, ast.Compare, ast.IfExp)):
+            other_src = f"({other_src})"
         original = ast.get_source_segment(source, node) or ""
 
         if discount_is_left:
