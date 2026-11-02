@@ -15,6 +15,14 @@ from .models.issue import BugCategory, CodeIssue, DetectionResult, Severity
 
 # 折扣 / 优惠相关的变量名。命中即认为它可能是"率"而不是"系数"
 DISCOUNT_PATTERN = re.compile(r"(discount|rebate|promo|coupon|off_rate)", re.IGNORECASE)
+# 已经是"折后系数"的命名（如 discount_factor = 1 - rate），这类不该报
+PRECOMPUTED_PATTERN = re.compile(r"(factor|multiplier|ratio|coef)", re.IGNORECASE)
+# 不是"率"的派生命名：discounted / discount_amount / discount_price
+# 它们是算完之后的结果，再拿去做乘法是正常写法，报了就是误伤
+DERIVED_PATTERN = re.compile(
+    r"(ed$|_amount|_price|_value|_total|_base|amount$|price$|value$|total$)",
+    re.IGNORECASE,
+)
 # 金额 / 比率相关的命名，用于浮点相等比较规则
 MONEY_PATTERN = re.compile(
     r"(price|total|amount|revenue|cost|balance|discount|rate|tax)", re.IGNORECASE
@@ -84,6 +92,10 @@ class BugDetector:
             if not isinstance(side, ast.Name):
                 continue
             name = side.id
+            if PRECOMPUTED_PATTERN.search(name):
+                continue  # discount_factor 这类已经是系数，不报
+            if DERIVED_PATTERN.search(name):
+                continue  # discounted / discount_amount 是结果值，不报
             if DISCOUNT_PATTERN.search(name):
                 return name
         return None
